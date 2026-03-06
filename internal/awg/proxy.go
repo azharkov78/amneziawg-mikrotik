@@ -23,26 +23,26 @@ var SocketBufSize = defaultSocketBuf
 
 // Proxy is a UDP proxy that transforms WireGuard packets to AmneziaWG format.
 type Proxy struct {
-	cfg        *Config
-	listenAddr *net.UDPAddr
-	remoteAddr *net.UDPAddr
-	clientAddr atomic.Pointer[netip.AddrPort]
-	remoteConn atomic.Pointer[net.UDPConn]
-	stopped    atomic.Bool
-	lastActive atomic.Bool // activity flag; set on recv, cleared by timeout checker
-	autoSrcPort bool       // auto-mode: take src port from first client packet
-	localPort   atomic.Int32 // desired src port for remote socket (0 = kernel assigns)
-	cpsCounter  uint32     // counter for CPS <c> tags
-	junkBuf     []byte     // pre-allocated: Jc * Jmax bytes for junk generation
-	junkPkts    [][]byte   // pre-allocated: Jc slice headers for junk packets
-	randBuf     []byte     // cyclic random buffer for S4 padding (64KB, c2s goroutine only)
-	randOff     int        // current offset into randBuf
-	rng         fastRand   // xorshift64 PRNG for hot-path (c2s goroutine only)
-	h4Ring        [256]uint32 // pre-computed H4 values for ring buffer
-	h4Idx         uint8       // current index into h4Ring (auto wraps)
-	handshakeDone atomic.Bool // true after forwarding handshake init; gates transport data
-	shutdownMu    sync.Mutex // protects shutdownFDs
-	shutdownFDs   []int      // blocking fds to shutdown on stop
+	cfg           *Config
+	listenAddr    *net.UDPAddr
+	remoteAddr    *net.UDPAddr
+	clientAddr    atomic.Pointer[netip.AddrPort]
+	remoteConn    atomic.Pointer[net.UDPConn]
+	stopped       atomic.Bool
+	lastActive    atomic.Bool  // activity flag; set on recv, cleared by timeout checker
+	autoSrcPort   bool         // auto-mode: take src port from first client packet
+	localPort     atomic.Int32 // desired src port for remote socket (0 = kernel assigns)
+	cpsCounter    uint32       // counter for CPS <c> tags
+	junkBuf       []byte       // pre-allocated: Jc * Jmax bytes for junk generation
+	junkPkts      [][]byte     // pre-allocated: Jc slice headers for junk packets
+	randBuf       []byte       // cyclic random buffer for S4 padding (64KB, c2s goroutine only)
+	randOff       int          // current offset into randBuf
+	rng           fastRand     // xorshift64 PRNG for hot-path (c2s goroutine only)
+	h4Ring        [256]uint32  // pre-computed H4 values for ring buffer
+	h4Idx         uint8        // current index into h4Ring (auto wraps)
+	handshakeDone atomic.Bool  // true after forwarding handshake init; gates transport data
+	shutdownMu    sync.Mutex   // protects shutdownFDs
+	shutdownFDs   []int        // blocking fds to shutdown on stop
 }
 
 const randBufSize = 65536 // 64KB cyclic random buffer for S4 padding
@@ -74,12 +74,21 @@ func NewProxy(cfg *Config, listenAddr, remoteAddr *net.UDPAddr, srcPort int) *Pr
 }
 
 // dialRemote dials the remote AWG server, optionally binding to localPort.
+// Uses SO_REUSEADDR (via setReuseAddr) to avoid EADDRINUSE during reconnect.
 func (p *Proxy) dialRemote() (*net.UDPConn, error) {
-	var local *net.UDPAddr
-	if port := int(p.localPort.Load()); port > 0 {
-		local = &net.UDPAddr{Port: port}
+	port := int(p.localPort.Load())
+	if port <= 0 {
+		return net.DialUDP("udp4", nil, p.remoteAddr)
 	}
-	return net.DialUDP("udp4", local, p.remoteAddr)
+	d := net.Dialer{
+		LocalAddr: &net.UDPAddr{Port: port},
+		Control:   setReuseAddr,
+	}
+	conn, err := d.Dial("udp4", p.remoteAddr.String())
+	if err != nil {
+		return nil, err
+	}
+	return conn.(*net.UDPConn), nil
 }
 
 // fillH4Ring fills the H4 ring buffer with pre-computed values.
@@ -422,7 +431,6 @@ func (p *Proxy) serverToClient(listenConn *net.UDPConn, remoteConn *net.UDPConn,
 	buf := make([]byte, bufSize)
 	currentRemote := remoteConn
 	backoff := time.Second
-	var pktCount uint8 = 255
 
 	for {
 		n, err := currentRemote.Read(buf)
@@ -442,7 +450,6 @@ func (p *Proxy) serverToClient(listenConn *net.UDPConn, remoteConn *net.UDPConn,
 			p.lastActive.Store(true)
 			p.handshakeDone.Store(false)
 			p.clientAddr.Store(nil)
-			pktCount = 255
 			if p.stopped.Load() {
 				newConn.Close()
 				return
@@ -450,10 +457,7 @@ func (p *Proxy) serverToClient(listenConn *net.UDPConn, remoteConn *net.UDPConn,
 			continue
 		}
 
-		pktCount++
-		if pktCount == 0 {
-			p.lastActive.Store(true)
-		}
+		p.lastActive.Store(true)
 		backoff = time.Second // reset backoff on success
 
 		if p.cfg.LogLevel >= LevelDebug {

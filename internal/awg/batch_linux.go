@@ -332,7 +332,6 @@ func (p *Proxy) clientToServerBatch(listenConn *net.UDPConn) {
 	var sendConn *net.UDPConn
 	cfg := p.cfg
 	gsoOK := true
-	var pktCount uint8 = 255
 
 	for {
 		nRecv, err := recvBatchFD(recvFD, recvBS)
@@ -344,10 +343,7 @@ func (p *Proxy) clientToServerBatch(listenConn *net.UDPConn) {
 			continue
 		}
 
-		pktCount += uint8(nRecv)
-		if pktCount < uint8(nRecv) {
-			p.lastActive.Store(true)
-		}
+		p.lastActive.Store(true)
 
 		currentRemote := p.remoteConn.Load()
 		if currentRemote != sendConn {
@@ -510,7 +506,12 @@ func (p *Proxy) serverToClientBatch(listenConn *net.UDPConn, remoteConn *net.UDP
 		LogError(p.cfg, "remote dup fd: ", err.Error())
 		return
 	}
-	defer syscall.Close(recvFD)
+	defer func() {
+		if recvFD >= 0 {
+			p.removeShutdownFD(recvFD)
+			syscall.Close(recvFD)
+		}
+	}()
 	p.registerShutdownFD(recvFD)
 
 	// Dup listen fd for sending (raw blocking, no Go poller overhead).
@@ -539,7 +540,6 @@ func (p *Proxy) serverToClientBatch(listenConn *net.UDPConn, remoteConn *net.UDP
 
 	currentRemote := remoteConn
 	backoff := time.Second
-	var pktCount uint8 = 255
 
 	var cachedAddr netip.AddrPort
 	var cachedSA sockaddrIn
@@ -553,7 +553,6 @@ func (p *Proxy) serverToClientBatch(listenConn *net.UDPConn, remoteConn *net.UDP
 		// === Receive ===
 		var nSend int
 		var recvErr error
-		var pktCountIncr int
 
 		if useGRO {
 			n, segSize, err := recvGRO(recvFD, gs)
@@ -568,9 +567,7 @@ func (p *Proxy) serverToClientBatch(listenConn *net.UDPConn, remoteConn *net.UDP
 						pktLen := end - off
 						nSend = processS2CPacket(gs.buf[off:end], pktLen, s4, cfg, sendBS, nSend)
 					}
-					pktCountIncr = (n + segSize - 1) / segSize
 				} else if n > 0 {
-					pktCountIncr = 1
 					nSend = processS2CPacket(gs.buf[:n], n, s4, cfg, sendBS, nSend)
 				}
 			}
@@ -578,7 +575,6 @@ func (p *Proxy) serverToClientBatch(listenConn *net.UDPConn, remoteConn *net.UDP
 			nRecv, err := recvBatchFD(recvFD, recvBS)
 			recvErr = err
 			if err == nil {
-				pktCountIncr = nRecv
 				for i := 0; i < nRecv; i++ {
 					pn := int(recvBS.msgs[i].Len)
 					if pn <= 0 {
@@ -595,6 +591,10 @@ func (p *Proxy) serverToClientBatch(listenConn *net.UDPConn, remoteConn *net.UDP
 				return
 			}
 			LogInfo(cfg, "remote: ", recvErr.Error(), ", reconnecting")
+			// Close recvFD BEFORE reconnect to release the port for rebind.
+			p.removeShutdownFD(recvFD)
+			syscall.Close(recvFD)
+			recvFD = -1
 			newConn := p.reconnectRemote(stop, &backoff)
 			if newConn == nil {
 				return
@@ -603,8 +603,6 @@ func (p *Proxy) serverToClientBatch(listenConn *net.UDPConn, remoteConn *net.UDP
 			currentRemote = newConn
 			p.remoteConn.Store(newConn)
 			setSocketBuffers(newConn, SocketBufSize)
-			p.removeShutdownFD(recvFD)
-			syscall.Close(recvFD)
 			recvFD, err = dupBlockingFD(newConn)
 			if err != nil {
 				LogError(cfg, "remote dup fd: ", err.Error())
@@ -617,7 +615,6 @@ func (p *Proxy) serverToClientBatch(listenConn *net.UDPConn, remoteConn *net.UDP
 			p.lastActive.Store(true)
 			p.handshakeDone.Store(false)
 			p.clientAddr.Store(nil)
-			pktCount = 255
 			addrCached = false
 			if p.stopped.Load() {
 				newConn.Close()
@@ -627,10 +624,7 @@ func (p *Proxy) serverToClientBatch(listenConn *net.UDPConn, remoteConn *net.UDP
 		}
 
 		// === Activity tracking ===
-		pktCount += uint8(pktCountIncr)
-		if pktCount < uint8(pktCountIncr) {
-			p.lastActive.Store(true)
-		}
+		p.lastActive.Store(true)
 		backoff = time.Second
 
 		// === Client addr check ===
